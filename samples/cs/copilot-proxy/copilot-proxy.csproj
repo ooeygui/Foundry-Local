@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>CopilotProxy</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AI.Foundry.Local" Version="0.9.0-dev" />
+    <PackageReference Include="Microsoft.AI.Foundry.Local.Core" Version="1.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="9.0.0" />
+  </ItemGroup>
+
+  <!-- Shared utilities -->
+  <ItemGroup>
+    <Compile Include="../Shared/*.cs" />
+  </ItemGroup>
+
+</Project>
