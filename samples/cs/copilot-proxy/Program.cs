@@ -1,18 +1,28 @@
 // Copilot Proxy — OpenAI-compatible server wrapping Foundry Local
-// Provides SSE streaming chat completions, WebSocket realtime API, and proper finish_reason handling.
+// Provides SSE streaming, WebSocket realtime API, tool calling support,
+// proper finish_reason handling, usage stats, and OpenAI error format.
 
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 using Microsoft.AI.Foundry.Local;
 
 // ---------------------------------------------------------------------------
-// Configuration
+// Configuration — supports both FOUNDRY_* and COPILOT_* env vars
 // ---------------------------------------------------------------------------
 var proxyPort = args.Length > 0 ? args[0] : "5001";
-var foundryUrl = Environment.GetEnvironmentVariable("FOUNDRY_URL") ?? "http://127.0.0.1:5273";
-var modelAlias = Environment.GetEnvironmentVariable("FOUNDRY_MODEL") ?? "phi-4-mini";
+var foundryUrl = Environment.GetEnvironmentVariable("FOUNDRY_URL")
+              ?? Environment.GetEnvironmentVariable("COPILOT_PROVIDER_BASE_URL")
+              ?? "http://127.0.0.1:5273";
+// Strip /v1 suffix if the user set a COPILOT_PROVIDER_BASE_URL that includes it
+if (foundryUrl.EndsWith("/v1", StringComparison.OrdinalIgnoreCase))
+    foundryUrl = foundryUrl[..^3];
+
+var modelAlias = Environment.GetEnvironmentVariable("FOUNDRY_MODEL")
+              ?? Environment.GetEnvironmentVariable("COPILOT_MODEL")
+              ?? "phi-4-mini";
 
 // ---------------------------------------------------------------------------
 // Initialize Foundry Local
@@ -67,7 +77,8 @@ else
 
 // Load model
 var catalog = await mgr.GetCatalogAsync();
-var model = await catalog.GetModelAsync(modelAlias) ?? throw new Exception($"Model '{modelAlias}' not found in catalog");
+var model = await catalog.GetModelAsync(modelAlias)
+    ?? throw new Exception($"Model '{modelAlias}' not found in catalog");
 await model.DownloadAsync(progress =>
 {
     Console.Write($"\rDownloading model: {progress:F1}%");
@@ -110,7 +121,30 @@ app.UseWebSockets(new WebSocketOptions
 app.UseCors(policy => policy
     .AllowAnyOrigin()
     .AllowAnyMethod()
-    .AllowAnyHeader());
+    .AllowAnyHeader()
+    .WithExposedHeaders("X-Request-Id"));
+
+// Global error handler — ensures all errors are in OpenAI format
+app.Use(async (ctx, next) =>
+{
+    try
+    {
+        await next();
+    }
+    catch (JsonException ex)
+    {
+        await WriteOpenAIError(ctx, 400, "invalid_request_error", $"Invalid JSON: {ex.Message}");
+    }
+    catch (OperationCanceledException)
+    {
+        // Client disconnected — don't write a response
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[Unhandled error: {ex.Message}]");
+        await WriteOpenAIError(ctx, 500, "server_error", "Internal server error");
+    }
+});
 
 // ---------------------------------------------------------------------------
 // Endpoints
@@ -153,11 +187,13 @@ app.MapPost("/v1/responses", async (HttpContext ctx, IHttpClientFactory httpFact
     };
 
     using var bodyDoc = JsonDocument.Parse(body);
-    var isStreaming = bodyDoc.RootElement.TryGetProperty("stream", out var streamProp) && streamProp.GetBoolean();
+    var isStreaming = bodyDoc.RootElement.TryGetProperty("stream", out var streamProp)
+                     && streamProp.GetBoolean();
 
     if (isStreaming)
     {
-        request.Headers.Accept.Add(new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("text/event-stream"));
+        request.Headers.Accept.Add(
+            new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("text/event-stream"));
         var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
         ctx.Response.ContentType = "text/event-stream";
         ctx.Response.Headers.CacheControl = "no-cache";
@@ -181,8 +217,7 @@ app.Map("/v1/realtime", async (HttpContext ctx) =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest)
     {
-        ctx.Response.StatusCode = 400;
-        await ctx.Response.WriteAsync("WebSocket connection required");
+        await WriteOpenAIError(ctx, 400, "invalid_request_error", "WebSocket connection required");
         return;
     }
 
@@ -195,24 +230,34 @@ Console.WriteLine($"  Chat completions: POST http://localhost:{proxyPort}/v1/cha
 Console.WriteLine($"  Models:           GET  http://localhost:{proxyPort}/v1/models");
 Console.WriteLine($"  Realtime WS:      ws://localhost:{proxyPort}/v1/realtime");
 Console.WriteLine($"  Model loaded:     {model.Id}");
+Console.WriteLine($"\nCopilot CLI config:");
+Console.WriteLine($"  export COPILOT_PROVIDER_BASE_URL=\"http://localhost:{proxyPort}/v1\"");
+Console.WriteLine($"  export COPILOT_MODEL=\"{model.Id}\"");
 Console.WriteLine();
 
 app.Run();
 
 // ---------------------------------------------------------------------------
-// Chat Completions Handler with proper SSE streaming
+// Chat Completions Handler with proper SSE streaming & tool calling
 // ---------------------------------------------------------------------------
 async Task HandleChatCompletions(HttpContext ctx, IHttpClientFactory httpFactory)
 {
     var client = httpFactory.CreateClient("foundry");
     var body = await new StreamReader(ctx.Request.Body).ReadToEndAsync();
 
+    // Check if the client requested usage stats before we strip stream_options
+    var wantsUsage = body.Contains("\"include_usage\"") && body.Contains("true");
+
+    // Sanitize the request body — strip fields Foundry may not support
+    body = SanitizeRequestBody(body);
+
     using var bodyDoc = JsonDocument.Parse(body);
-    var isStreaming = bodyDoc.RootElement.TryGetProperty("stream", out var streamProp) && streamProp.GetBoolean();
+    var isStreaming = bodyDoc.RootElement.TryGetProperty("stream", out var streamProp)
+                     && streamProp.GetBoolean();
 
     if (isStreaming)
     {
-        await HandleStreamingChatCompletion(ctx, client, body);
+        await HandleStreamingChatCompletion(ctx, client, body, wantsUsage);
     }
     else
     {
@@ -227,18 +272,38 @@ async Task HandleNonStreamingChatCompletion(HttpContext ctx, HttpClient client, 
         Content = new StringContent(body, Encoding.UTF8, "application/json")
     };
 
-    var response = await client.SendAsync(request);
-    var content = await response.Content.ReadAsStringAsync();
+    HttpResponseMessage response;
+    try
+    {
+        response = await client.SendAsync(request, ctx.RequestAborted);
+    }
+    catch (HttpRequestException ex)
+    {
+        await WriteOpenAIError(ctx, 502, "upstream_error", $"Foundry backend error: {ex.Message}");
+        return;
+    }
 
-    // Ensure finish_reason is present
-    content = EnsureFinishReason(content);
+    var content = await response.Content.ReadAsStringAsync(ctx.RequestAborted);
+
+    if (!response.IsSuccessStatusCode)
+    {
+        content = WrapAsOpenAIError(content, (int)response.StatusCode);
+        ctx.Response.ContentType = "application/json";
+        ctx.Response.StatusCode = (int)response.StatusCode;
+        await ctx.Response.WriteAsync(content, ctx.RequestAborted);
+        return;
+    }
+
+    // Fix up the response: ensure finish_reason, add usage if missing
+    content = FixNonStreamingResponse(content);
 
     ctx.Response.ContentType = "application/json";
     ctx.Response.StatusCode = (int)response.StatusCode;
-    await ctx.Response.WriteAsync(content);
+    await ctx.Response.WriteAsync(content, ctx.RequestAborted);
 }
 
-async Task HandleStreamingChatCompletion(HttpContext ctx, HttpClient client, string body)
+async Task HandleStreamingChatCompletion(
+    HttpContext ctx, HttpClient client, string body, bool includeUsage)
 {
     ctx.Response.ContentType = "text/event-stream";
     ctx.Response.Headers.CacheControl = "no-cache";
@@ -253,24 +318,27 @@ async Task HandleStreamingChatCompletion(HttpContext ctx, HttpClient client, str
     HttpResponseMessage response;
     try
     {
-        response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ctx.RequestAborted);
+        response = await client.SendAsync(
+            request, HttpCompletionOption.ResponseHeadersRead, ctx.RequestAborted);
     }
     catch
     {
-        // If the backend doesn't support the slash path, try underscore path
+        // Fallback: try underscore path if slash path fails
         var fallbackRequest = new HttpRequestMessage(HttpMethod.Post, "/v1/chat_completions")
         {
             Content = new StringContent(body, Encoding.UTF8, "application/json")
         };
-        response = await client.SendAsync(fallbackRequest, HttpCompletionOption.ResponseHeadersRead, ctx.RequestAborted);
+        response = await client.SendAsync(
+            fallbackRequest, HttpCompletionOption.ResponseHeadersRead, ctx.RequestAborted);
     }
 
     if (!response.IsSuccessStatusCode)
     {
-        var errorContent = await response.Content.ReadAsStringAsync();
-        ctx.Response.StatusCode = (int)response.StatusCode;
+        var errorContent = await response.Content.ReadAsStringAsync(ctx.RequestAborted);
         ctx.Response.ContentType = "application/json";
-        await ctx.Response.WriteAsync(errorContent);
+        ctx.Response.StatusCode = (int)response.StatusCode;
+        await ctx.Response.WriteAsync(
+            WrapAsOpenAIError(errorContent, (int)response.StatusCode), ctx.RequestAborted);
         return;
     }
 
@@ -279,6 +347,8 @@ async Task HandleStreamingChatCompletion(HttpContext ctx, HttpClient client, str
 
     var sentDone = false;
     var sawFinishReason = false;
+    var sawToolCalls = false;
+    var chunkCount = 0;
 
     while (!reader.EndOfStream && !ctx.RequestAborted.IsCancellationRequested)
     {
@@ -287,6 +357,12 @@ async Task HandleStreamingChatCompletion(HttpContext ctx, HttpClient client, str
 
         if (line == "data: [DONE]")
         {
+            // If usage was requested, inject a final usage chunk before [DONE]
+            if (includeUsage)
+            {
+                var usageChunk = CreateUsageChunk(body, chunkCount);
+                await ctx.Response.WriteAsync($"data: {usageChunk}\n\n", ctx.RequestAborted);
+            }
             await ctx.Response.WriteAsync("data: [DONE]\n\n", ctx.RequestAborted);
             await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
             sentDone = true;
@@ -296,12 +372,10 @@ async Task HandleStreamingChatCompletion(HttpContext ctx, HttpClient client, str
         if (line.StartsWith("data: "))
         {
             var jsonData = line["data: ".Length..];
+            chunkCount++;
 
-            // Check if this chunk contains a finish_reason
-            if (jsonData.Contains("\"finish_reason\"") && !jsonData.Contains("\"finish_reason\":null") && !jsonData.Contains("\"finish_reason\": null"))
-            {
-                sawFinishReason = true;
-            }
+            // Fix up the chunk: handle finish_reason and tool_calls
+            jsonData = FixStreamChunk(jsonData, ref sawFinishReason, ref sawToolCalls);
 
             await ctx.Response.WriteAsync($"data: {jsonData}\n\n", ctx.RequestAborted);
             await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
@@ -314,13 +388,19 @@ async Task HandleStreamingChatCompletion(HttpContext ctx, HttpClient client, str
     }
 
     // If the stream ended without proper termination, fix it up for Copilot
-    if (!sentDone)
+    if (!sentDone && !ctx.RequestAborted.IsCancellationRequested)
     {
         if (!sawFinishReason)
         {
-            // Send a final chunk with finish_reason: "stop"
-            var finalChunk = CreateFinalStopChunk(body);
+            // Determine the right finish_reason based on whether tool calls were seen
+            var reason = sawToolCalls ? "tool_calls" : "stop";
+            var finalChunk = CreateFinalChunk(body, reason);
             await ctx.Response.WriteAsync($"data: {finalChunk}\n\n", ctx.RequestAborted);
+        }
+        if (includeUsage)
+        {
+            var usageChunk = CreateUsageChunk(body, chunkCount);
+            await ctx.Response.WriteAsync($"data: {usageChunk}\n\n", ctx.RequestAborted);
         }
         await ctx.Response.WriteAsync("data: [DONE]\n\n", ctx.RequestAborted);
         await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
@@ -374,7 +454,8 @@ async Task HandleRealtimeWebSocket(WebSocket ws, string modelId)
     }
 }
 
-async Task HandleRealtimeMessage(WebSocket ws, OpenAIChatClient chatClient, string message, string modelId)
+async Task HandleRealtimeMessage(
+    WebSocket ws, OpenAIChatClient chatClient, string message, string modelId)
 {
     using var doc = JsonDocument.Parse(message);
     var type = doc.RootElement.GetProperty("type").GetString();
@@ -418,12 +499,12 @@ async Task HandleRealtimeMessage(WebSocket ws, OpenAIChatClient chatClient, stri
     }
 }
 
-async Task HandleRealtimeResponseCreate(WebSocket ws, OpenAIChatClient chatClient, JsonDocument doc, string modelId)
+async Task HandleRealtimeResponseCreate(
+    WebSocket ws, OpenAIChatClient chatClient, JsonDocument doc, string modelId)
 {
     var responseId = $"resp_{Guid.NewGuid():N}";
     var itemId = $"item_{Guid.NewGuid():N}";
 
-    // Send response.created
     await SendWebSocketMessage(ws, JsonSerializer.Serialize(new
     {
         type = "response.created",
@@ -445,7 +526,8 @@ async Task HandleRealtimeResponseCreate(WebSocket ws, OpenAIChatClient chatClien
         {
             foreach (var inputItem in inputItems.EnumerateArray())
             {
-                if (inputItem.TryGetProperty("type", out var itemType) && itemType.GetString() == "message")
+                if (inputItem.TryGetProperty("type", out var itemType)
+                    && itemType.GetString() == "message")
                 {
                     var role = inputItem.TryGetProperty("role", out var r) ? r.GetString() : "user";
                     if (inputItem.TryGetProperty("content", out var content))
@@ -456,9 +538,11 @@ async Task HandleRealtimeResponseCreate(WebSocket ws, OpenAIChatClient chatClien
                             {
                                 var textStr = text.GetString() ?? "";
                                 if (role == "user")
-                                    messages.Add(Betalgo.Ranul.OpenAI.ObjectModels.RequestModels.ChatMessage.FromUser(textStr));
+                                    messages.Add(Betalgo.Ranul.OpenAI.ObjectModels.RequestModels
+                                        .ChatMessage.FromUser(textStr));
                                 else if (role == "assistant")
-                                    messages.Add(Betalgo.Ranul.OpenAI.ObjectModels.RequestModels.ChatMessage.FromAssistant(textStr));
+                                    messages.Add(Betalgo.Ranul.OpenAI.ObjectModels.RequestModels
+                                        .ChatMessage.FromAssistant(textStr));
                             }
                         }
                     }
@@ -469,14 +553,16 @@ async Task HandleRealtimeResponseCreate(WebSocket ws, OpenAIChatClient chatClien
 
     if (messages.Count == 0)
     {
-        messages.Add(Betalgo.Ranul.OpenAI.ObjectModels.RequestModels.ChatMessage.FromUser("Hello"));
+        messages.Add(
+            Betalgo.Ranul.OpenAI.ObjectModels.RequestModels.ChatMessage.FromUser("Hello"));
     }
 
     // Stream the response
     var fullText = new StringBuilder();
     try
     {
-        await foreach (var chunk in chatClient.CompleteChatStreamingAsync(messages, CancellationToken.None))
+        await foreach (var chunk in chatClient.CompleteChatStreamingAsync(
+                           messages, CancellationToken.None))
         {
             var text = chunk.Choices?.FirstOrDefault()?.Delta?.Content ?? "";
             if (!string.IsNullOrEmpty(text))
@@ -538,90 +624,203 @@ async Task SendWebSocketMessage(WebSocket ws, string message)
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Request sanitization — strip fields Foundry doesn't understand
 // ---------------------------------------------------------------------------
-string EnsureFinishReason(string json)
+string SanitizeRequestBody(string body)
 {
     try
     {
-        using var doc = JsonDocument.Parse(json);
-        if (!doc.RootElement.TryGetProperty("choices", out var choices)) return json;
+        var node = JsonNode.Parse(body);
+        if (node is not JsonObject obj) return body;
 
         var modified = false;
-        using var ms = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(ms))
+
+        // Remove stream_options — Foundry may reject this unknown field.
+        // We handle include_usage ourselves in the proxy.
+        if (obj.ContainsKey("stream_options"))
         {
-            writer.WriteStartObject();
-            foreach (var prop in doc.RootElement.EnumerateObject())
-            {
-                if (prop.Name == "choices")
-                {
-                    writer.WritePropertyName("choices");
-                    writer.WriteStartArray();
-                    foreach (var choice in prop.Value.EnumerateArray())
-                    {
-                        writer.WriteStartObject();
-                        var hasFinishReason = false;
-                        foreach (var cp in choice.EnumerateObject())
-                        {
-                            if (cp.Name == "finish_reason")
-                            {
-                                hasFinishReason = true;
-                                if (cp.Value.ValueKind == JsonValueKind.Null)
-                                {
-                                    writer.WriteString("finish_reason", "stop");
-                                    modified = true;
-                                }
-                                else
-                                {
-                                    cp.WriteTo(writer);
-                                }
-                            }
-                            else
-                            {
-                                cp.WriteTo(writer);
-                            }
-                        }
-                        if (!hasFinishReason)
-                        {
-                            writer.WriteString("finish_reason", "stop");
-                            modified = true;
-                        }
-                        writer.WriteEndObject();
-                    }
-                    writer.WriteEndArray();
-                }
-                else
-                {
-                    prop.WriteTo(writer);
-                }
-            }
-            writer.WriteEndObject();
+            obj.Remove("stream_options");
+            modified = true;
+        }
+
+        // Remove parallel_tool_calls if Foundry doesn't support it
+        if (obj.ContainsKey("parallel_tool_calls"))
+        {
+            obj.Remove("parallel_tool_calls");
+            modified = true;
+        }
+
+        // Remove service_tier — not relevant for local inference
+        if (obj.ContainsKey("service_tier"))
+        {
+            obj.Remove("service_tier");
+            modified = true;
         }
 
         if (modified)
         {
-            return Encoding.UTF8.GetString(ms.ToArray());
+            return obj.ToJsonString();
         }
     }
     catch
     {
-        // If we can't parse, return as-is
+        // If parsing fails, return as-is
+    }
+
+    return body;
+}
+
+// ---------------------------------------------------------------------------
+// Stream chunk fixups — tool calling, finish_reason, usage
+// ---------------------------------------------------------------------------
+
+/// <summary>
+/// Fix a single SSE streaming chunk:
+/// - Ensure finish_reason is not silently null when content is present
+/// - Track tool_calls presence for proper finish_reason injection
+/// - Preserve tool_calls delta structure for Copilot
+/// </summary>
+string FixStreamChunk(string json, ref bool sawFinishReason, ref bool sawToolCalls)
+{
+    try
+    {
+        using var doc = JsonDocument.Parse(json);
+        if (!doc.RootElement.TryGetProperty("choices", out var choices))
+            return json;
+
+        foreach (var choice in choices.EnumerateArray())
+        {
+            // Track if this chunk has tool_calls in the delta
+            if (choice.TryGetProperty("delta", out var delta)
+                && delta.TryGetProperty("tool_calls", out _))
+            {
+                sawToolCalls = true;
+            }
+
+            // Track finish_reason
+            if (choice.TryGetProperty("finish_reason", out var fr)
+                && fr.ValueKind != JsonValueKind.Null)
+            {
+                sawFinishReason = true;
+
+                // If the model said "stop" but we saw tool_calls, fix it to "tool_calls"
+                if (sawToolCalls && fr.GetString() == "stop")
+                {
+                    return RewriteFinishReason(json, "tool_calls");
+                }
+            }
+        }
+    }
+    catch
+    {
+        // Pass through unparseable chunks
     }
 
     return json;
 }
 
-string CreateFinalStopChunk(string originalRequestBody)
+/// <summary>
+/// Fix a non-streaming response: ensure finish_reason, add usage if missing.
+/// </summary>
+string FixNonStreamingResponse(string json)
 {
-    var modelName = "unknown";
     try
     {
-        using var doc = JsonDocument.Parse(originalRequestBody);
-        if (doc.RootElement.TryGetProperty("model", out var m))
-            modelName = m.GetString() ?? "unknown";
+        var node = JsonNode.Parse(json);
+        if (node is not JsonObject obj) return json;
+
+        var modified = false;
+
+        // Fix finish_reason in choices
+        if (obj["choices"] is JsonArray choicesArr)
+        {
+            foreach (var choice in choicesArr)
+            {
+                if (choice is not JsonObject choiceObj) continue;
+
+                // Fix null/missing finish_reason
+                var hasToolCalls = choiceObj["message"] is JsonObject msgObj
+                                   && msgObj.ContainsKey("tool_calls");
+                var expectedReason = hasToolCalls ? "tool_calls" : "stop";
+
+                if (!choiceObj.ContainsKey("finish_reason")
+                    || choiceObj["finish_reason"] is null
+                    || choiceObj["finish_reason"]!.GetValueKind() == JsonValueKind.Null)
+                {
+                    choiceObj["finish_reason"] = expectedReason;
+                    modified = true;
+                }
+
+                // If finish_reason is "stop" but there are tool_calls, fix it
+                if (choiceObj["finish_reason"]?.GetValue<string>() == "stop" && hasToolCalls)
+                {
+                    choiceObj["finish_reason"] = "tool_calls";
+                    modified = true;
+                }
+            }
+        }
+
+        // Add usage if missing
+        if (!obj.ContainsKey("usage") || obj["usage"] is null
+            || obj["usage"]!.GetValueKind() == JsonValueKind.Null)
+        {
+            obj["usage"] = new JsonObject
+            {
+                ["prompt_tokens"] = 0,
+                ["completion_tokens"] = 0,
+                ["total_tokens"] = 0
+            };
+            modified = true;
+        }
+
+        if (modified)
+        {
+            return obj.ToJsonString();
+        }
     }
-    catch { }
+    catch
+    {
+        // If parsing fails, return as-is
+    }
+
+    return json;
+}
+
+/// <summary>
+/// Rewrite finish_reason in a JSON chunk string.
+/// </summary>
+string RewriteFinishReason(string json, string newReason)
+{
+    try
+    {
+        var node = JsonNode.Parse(json);
+        if (node is not JsonObject obj) return json;
+
+        if (obj["choices"] is JsonArray choices)
+        {
+            foreach (var choice in choices)
+            {
+                if (choice is JsonObject choiceObj)
+                {
+                    choiceObj["finish_reason"] = newReason;
+                }
+            }
+        }
+
+        return obj.ToJsonString();
+    }
+    catch
+    {
+        return json;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chunk creation helpers
+// ---------------------------------------------------------------------------
+string CreateFinalChunk(string originalRequestBody, string finishReason)
+{
+    var modelName = ExtractModelName(originalRequestBody);
 
     return JsonSerializer.Serialize(new
     {
@@ -635,8 +834,161 @@ string CreateFinalStopChunk(string originalRequestBody)
             {
                 index = 0,
                 delta = new { },
-                finish_reason = "stop"
+                finish_reason = finishReason
             }
         }
     });
+}
+
+string CreateUsageChunk(string originalRequestBody, int completionTokenEstimate)
+{
+    var modelName = ExtractModelName(originalRequestBody);
+
+    // Estimate token counts from the request/response.
+    // Without a real tokenizer, we approximate from character counts.
+    var promptTokenEstimate = EstimatePromptTokens(originalRequestBody);
+
+    return JsonSerializer.Serialize(new
+    {
+        id = $"chatcmpl-{Guid.NewGuid():N}",
+        @object = "chat.completion.chunk",
+        created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+        model = modelName,
+        choices = Array.Empty<object>(),
+        usage = new
+        {
+            prompt_tokens = promptTokenEstimate,
+            completion_tokens = completionTokenEstimate,
+            total_tokens = promptTokenEstimate + completionTokenEstimate
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI error response format
+// ---------------------------------------------------------------------------
+async Task WriteOpenAIError(HttpContext ctx, int statusCode, string type, string message)
+{
+    if (ctx.Response.HasStarted) return;
+
+    ctx.Response.ContentType = "application/json";
+    ctx.Response.StatusCode = statusCode;
+
+    var error = JsonSerializer.Serialize(new
+    {
+        error = new
+        {
+            message,
+            type,
+            param = (string?)null,
+            code = (string?)null
+        }
+    });
+
+    await ctx.Response.WriteAsync(error);
+}
+
+/// <summary>
+/// Wrap an error response from Foundry in OpenAI error format if it isn't already.
+/// </summary>
+string WrapAsOpenAIError(string content, int statusCode)
+{
+    try
+    {
+        using var doc = JsonDocument.Parse(content);
+        // Already in OpenAI format?
+        if (doc.RootElement.TryGetProperty("error", out var errorObj)
+            && errorObj.TryGetProperty("message", out _))
+        {
+            return content;
+        }
+
+        // Extract message from various Foundry error formats
+        string message;
+        if (doc.RootElement.TryGetProperty("error", out var simpleError)
+            && simpleError.ValueKind == JsonValueKind.String)
+        {
+            message = simpleError.GetString() ?? "Unknown error";
+        }
+        else if (doc.RootElement.TryGetProperty("detail", out var detail))
+        {
+            message = detail.GetString() ?? detail.ToString();
+        }
+        else if (doc.RootElement.TryGetProperty("message", out var msg))
+        {
+            message = msg.GetString() ?? "Unknown error";
+        }
+        else
+        {
+            message = content;
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            error = new
+            {
+                message,
+                type = statusCode >= 500 ? "server_error" : "invalid_request_error",
+                param = (string?)null,
+                code = (string?)null
+            }
+        });
+    }
+    catch
+    {
+        // Content isn't even JSON
+        return JsonSerializer.Serialize(new
+        {
+            error = new
+            {
+                message = content,
+                type = "server_error",
+                param = (string?)null,
+                code = (string?)null
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Utility helpers
+// ---------------------------------------------------------------------------
+string ExtractModelName(string requestBody)
+{
+    try
+    {
+        using var doc = JsonDocument.Parse(requestBody);
+        if (doc.RootElement.TryGetProperty("model", out var m))
+            return m.GetString() ?? model.Id;
+    }
+    catch { }
+
+    return model.Id;
+}
+
+int EstimatePromptTokens(string requestBody)
+{
+    // Rough estimate: ~4 chars per token for English text
+    try
+    {
+        using var doc = JsonDocument.Parse(requestBody);
+        if (doc.RootElement.TryGetProperty("messages", out var messages))
+        {
+            var totalChars = 0;
+            foreach (var msg in messages.EnumerateArray())
+            {
+                if (msg.TryGetProperty("content", out var content))
+                {
+                    if (content.ValueKind == JsonValueKind.String)
+                        totalChars += content.GetString()?.Length ?? 0;
+                    else
+                        totalChars += content.ToString().Length;
+                }
+            }
+            return Math.Max(1, totalChars / 4);
+        }
+    }
+    catch { }
+
+    return 0;
 }
