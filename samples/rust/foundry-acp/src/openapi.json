@@ -1,0 +1,600 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Foundry ACP — Agent Communication Protocol Server",
+    "description": "ACP v0.2.3 compliant server backed by Foundry Local AI models.",
+    "version": "0.1.0",
+    "license": {
+      "name": "MIT"
+    },
+    "contact": {
+      "name": "Microsoft",
+      "url": "https://github.com/microsoft/Foundry-Local"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8088",
+      "description": "Local development server"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "operationId": "healthCheck",
+        "tags": ["System"],
+        "responses": {
+          "200": {
+            "description": "Server is healthy",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agents/search": {
+      "post": {
+        "summary": "Search agents",
+        "operationId": "searchAgents",
+        "tags": ["Agents"],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AgentSearchRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "List of matching agents",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/Agent" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agents/{agent_id}": {
+      "get": {
+        "summary": "Get agent by ID",
+        "operationId": "getAgent",
+        "tags": ["Agents"],
+        "parameters": [
+          { "name": "agent_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "200": { "description": "Agent found" },
+          "404": { "description": "Agent not found" }
+        }
+      }
+    },
+    "/agents/{agent_id}/descriptor": {
+      "get": {
+        "summary": "Get agent descriptor",
+        "operationId": "getAgentDescriptor",
+        "tags": ["Agents"],
+        "parameters": [
+          { "name": "agent_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "200": { "description": "Agent descriptor with schemas and capabilities" },
+          "404": { "description": "Agent not found" }
+        }
+      }
+    },
+    "/runs": {
+      "post": {
+        "summary": "Create a background run",
+        "operationId": "createRun",
+        "tags": ["Runs"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RunCreateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Run created with pending status" },
+          "404": { "description": "Agent not found" }
+        }
+      }
+    },
+    "/runs/wait": {
+      "post": {
+        "summary": "Create a run and wait for completion",
+        "operationId": "createRunWait",
+        "tags": ["Runs"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RunCreateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Run completed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RunResult" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/runs/stream": {
+      "post": {
+        "summary": "Create a run and stream results via SSE",
+        "operationId": "createRunStream",
+        "tags": ["Runs"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RunCreateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "SSE stream of run events",
+            "content": {
+              "text/event-stream": {}
+            }
+          }
+        }
+      }
+    },
+    "/runs/search": {
+      "post": {
+        "summary": "Search runs",
+        "operationId": "searchRuns",
+        "tags": ["Runs"],
+        "responses": {
+          "200": { "description": "List of matching runs" }
+        }
+      }
+    },
+    "/runs/{run_id}": {
+      "get": {
+        "summary": "Get run by ID",
+        "operationId": "getRun",
+        "tags": ["Runs"],
+        "parameters": [
+          { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "200": { "description": "Run found" },
+          "404": { "description": "Run not found" }
+        }
+      },
+      "post": {
+        "summary": "Resume a run (not supported)",
+        "operationId": "resumeRun",
+        "tags": ["Runs"],
+        "parameters": [
+          { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "422": { "description": "Resume not supported by this agent" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a run",
+        "operationId": "deleteRun",
+        "tags": ["Runs"],
+        "parameters": [
+          { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "204": { "description": "Run deleted" },
+          "404": { "description": "Run not found" }
+        }
+      }
+    },
+    "/runs/{run_id}/wait": {
+      "get": {
+        "summary": "Wait for a run to complete",
+        "operationId": "waitRun",
+        "tags": ["Runs"],
+        "parameters": [
+          { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "200": { "description": "Run completed" }
+        }
+      }
+    },
+    "/runs/{run_id}/stream": {
+      "get": {
+        "summary": "Attach to run SSE stream",
+        "operationId": "streamRun",
+        "tags": ["Runs"],
+        "parameters": [
+          { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "200": { "description": "SSE stream" }
+        }
+      }
+    },
+    "/runs/{run_id}/cancel": {
+      "post": {
+        "summary": "Cancel a run",
+        "operationId": "cancelRun",
+        "tags": ["Runs"],
+        "parameters": [
+          { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "204": { "description": "Run cancelled" }
+        }
+      }
+    },
+    "/threads": {
+      "post": {
+        "summary": "Create a thread",
+        "operationId": "createThread",
+        "tags": ["Threads"],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ThreadCreateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Thread created" },
+          "409": { "description": "Thread already exists" }
+        }
+      }
+    },
+    "/threads/search": {
+      "post": {
+        "summary": "Search threads",
+        "operationId": "searchThreads",
+        "tags": ["Threads"],
+        "responses": {
+          "200": { "description": "List of matching threads" }
+        }
+      }
+    },
+    "/threads/{thread_id}": {
+      "get": {
+        "summary": "Get thread",
+        "operationId": "getThread",
+        "tags": ["Threads"],
+        "parameters": [
+          { "name": "thread_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Thread found" },
+          "404": { "description": "Thread not found" }
+        }
+      },
+      "patch": {
+        "summary": "Update thread metadata",
+        "operationId": "patchThread",
+        "tags": ["Threads"],
+        "parameters": [
+          { "name": "thread_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Thread updated" }
+        }
+      },
+      "delete": {
+        "summary": "Delete thread",
+        "operationId": "deleteThread",
+        "tags": ["Threads"],
+        "parameters": [
+          { "name": "thread_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "204": { "description": "Thread deleted" }
+        }
+      }
+    },
+    "/threads/{thread_id}/copy": {
+      "post": {
+        "summary": "Deep-copy a thread",
+        "operationId": "copyThread",
+        "tags": ["Threads"],
+        "parameters": [
+          { "name": "thread_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Thread copied" }
+        }
+      }
+    },
+    "/threads/{thread_id}/history": {
+      "get": {
+        "summary": "Get thread state history",
+        "operationId": "getThreadHistory",
+        "tags": ["Threads"],
+        "parameters": [
+          { "name": "thread_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Thread history" }
+        }
+      }
+    },
+    "/threads/{thread_id}/runs": {
+      "get": {
+        "summary": "List runs for a thread",
+        "operationId": "listThreadRuns",
+        "tags": ["Thread Runs"],
+        "parameters": [
+          { "name": "thread_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "List of thread runs" }
+        }
+      },
+      "post": {
+        "summary": "Create a thread run",
+        "operationId": "createThreadRun",
+        "tags": ["Thread Runs"],
+        "parameters": [
+          { "name": "thread_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Thread run created" }
+        }
+      }
+    },
+    "/threads/{thread_id}/runs/wait": {
+      "post": {
+        "summary": "Create and wait for thread run",
+        "operationId": "createThreadRunWait",
+        "tags": ["Thread Runs"],
+        "parameters": [
+          { "name": "thread_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Thread run completed" }
+        }
+      }
+    },
+    "/threads/{thread_id}/runs/stream": {
+      "post": {
+        "summary": "Create and stream thread run via SSE",
+        "operationId": "createThreadRunStream",
+        "tags": ["Thread Runs"],
+        "parameters": [
+          { "name": "thread_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "SSE stream" }
+        }
+      }
+    },
+    "/threads/{thread_id}/runs/{run_id}": {
+      "get": {
+        "summary": "Get thread run",
+        "operationId": "getThreadRun",
+        "tags": ["Thread Runs"],
+        "parameters": [
+          { "name": "thread_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "200": { "description": "Thread run found" }
+        }
+      },
+      "delete": {
+        "summary": "Delete thread run",
+        "operationId": "deleteThreadRun",
+        "tags": ["Thread Runs"],
+        "parameters": [
+          { "name": "thread_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "204": { "description": "Thread run deleted" }
+        }
+      }
+    },
+    "/threads/{thread_id}/runs/{run_id}/cancel": {
+      "post": {
+        "summary": "Cancel thread run",
+        "operationId": "cancelThreadRun",
+        "tags": ["Thread Runs"],
+        "parameters": [
+          { "name": "thread_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "204": { "description": "Thread run cancelled" }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "summary": "Prometheus metrics",
+        "operationId": "getMetrics",
+        "tags": ["System"],
+        "responses": {
+          "200": {
+            "description": "Prometheus text format metrics",
+            "content": { "text/plain": {} }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "OpenAPI specification",
+        "operationId": "getOpenApiSpec",
+        "tags": ["System"],
+        "responses": {
+          "200": {
+            "description": "This OpenAPI specification",
+            "content": { "application/json": {} }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "HealthResponse": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string" },
+          "version": { "type": "string" },
+          "acp_spec_version": { "type": "string" },
+          "uptime_seconds": { "type": "integer" },
+          "agents_registered": { "type": "integer" },
+          "threads_active": { "type": "integer" },
+          "runs_active": { "type": "integer" },
+          "models": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ModelHealth" }
+          }
+        }
+      },
+      "ModelHealth": {
+        "type": "object",
+        "properties": {
+          "alias": { "type": "string" },
+          "agent_id": { "type": "string", "format": "uuid" },
+          "loaded": { "type": "boolean" }
+        }
+      },
+      "Agent": {
+        "type": "object",
+        "required": ["agent_id", "metadata"],
+        "properties": {
+          "agent_id": { "type": "string", "format": "uuid" },
+          "metadata": { "$ref": "#/components/schemas/AgentMetadata" }
+        }
+      },
+      "AgentMetadata": {
+        "type": "object",
+        "properties": {
+          "ref": { "$ref": "#/components/schemas/AgentRef" },
+          "description": { "type": "string" }
+        }
+      },
+      "AgentRef": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "version": { "type": "string" },
+          "url": { "type": "string", "format": "uri" }
+        }
+      },
+      "AgentSearchRequest": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "limit": { "type": "integer", "default": 100 },
+          "offset": { "type": "integer", "default": 0 }
+        }
+      },
+      "RunCreateRequest": {
+        "type": "object",
+        "required": ["agent_id"],
+        "properties": {
+          "agent_id": { "type": "string", "format": "uuid" },
+          "input": {
+            "description": "Messages array or plain string",
+            "oneOf": [
+              { "type": "object" },
+              { "type": "string" }
+            ]
+          },
+          "config": {
+            "type": "object",
+            "properties": {
+              "configurable": {
+                "type": "object",
+                "properties": {
+                  "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+                  "max_tokens": { "type": "integer", "minimum": 1 },
+                  "top_p": { "type": "number", "minimum": 0, "maximum": 1 }
+                }
+              }
+            }
+          },
+          "metadata": { "type": "object" }
+        }
+      },
+      "RunResult": {
+        "type": "object",
+        "properties": {
+          "run": { "$ref": "#/components/schemas/Run" },
+          "output": { "$ref": "#/components/schemas/RunOutput" }
+        }
+      },
+      "Run": {
+        "type": "object",
+        "properties": {
+          "run_id": { "type": "string", "format": "uuid" },
+          "agent_id": { "type": "string", "format": "uuid" },
+          "thread_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["pending", "error", "success", "timeout", "interrupted"] },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" },
+          "metadata": { "type": "object" }
+        }
+      },
+      "RunOutput": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string" },
+          "values": { "type": "object" },
+          "messages": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Message" }
+          }
+        }
+      },
+      "Message": {
+        "type": "object",
+        "properties": {
+          "role": { "type": "string", "enum": ["user", "assistant", "system"] },
+          "content": { "type": "string" }
+        }
+      },
+      "ThreadCreateRequest": {
+        "type": "object",
+        "properties": {
+          "thread_id": { "type": "string" },
+          "metadata": { "type": "object" },
+          "if_exists": { "type": "string", "enum": ["raise", "do_nothing"], "default": "raise" }
+        }
+      },
+      "Thread": {
+        "type": "object",
+        "properties": {
+          "thread_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["idle", "busy", "interrupted", "error"] },
+          "messages": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Message" }
+          },
+          "metadata": { "type": "object" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    }
+  }
+}

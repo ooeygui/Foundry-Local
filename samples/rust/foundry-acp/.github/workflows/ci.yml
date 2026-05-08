@@ -1,0 +1,108 @@
+name: Foundry ACP CI
+
+on:
+  push:
+    paths:
+      - 'samples/rust/foundry-acp/**'
+      - 'sdk/rust/**'
+  pull_request:
+    paths:
+      - 'samples/rust/foundry-acp/**'
+      - 'sdk/rust/**'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Check & Clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            samples/rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('samples/rust/**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Cargo check
+        working-directory: samples/rust
+        run: cargo check -p foundry-acp
+
+      - name: Clippy
+        working-directory: samples/rust
+        run: cargo clippy -p foundry-acp -- -D warnings -A deprecated
+
+  build:
+    name: Build
+    runs-on: windows-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            samples/rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('samples/rust/**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build (release)
+        working-directory: samples/rust
+        run: cargo build -p foundry-acp --release
+
+      - name: Build with TLS
+        working-directory: samples/rust
+        run: cargo build -p foundry-acp --release --features tls
+
+      - name: Build with Windows Service
+        working-directory: samples/rust
+        run: cargo build -p foundry-acp --release --features windows-service
+
+      - name: Compile tests
+        working-directory: samples/rust
+        run: cargo test -p foundry-acp --no-run
+
+  # Integration tests require Foundry Local runtime — run manually or in nightly
+  integration:
+    name: Integration Tests
+    runs-on: windows-latest
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[integration]')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            samples/rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('samples/rust/**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Run integration tests
+        working-directory: samples/rust
+        run: cargo test -p foundry-acp --test acp_integration -- --ignored --test-threads=1
+        timeout-minutes: 15
