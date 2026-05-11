@@ -138,124 +138,151 @@ impl AppState {
 
         for model in &models {
             let alias = model.alias().to_string();
-            let id = agent_id_from_alias(&alias);
-            let info = model.info();
-
-            let description = format!(
-                "Foundry Local model '{}' ({}) — {}",
-                alias,
-                info.model_type,
-                info.display_name
-                    .as_deref()
-                    .unwrap_or(&info.name)
-            );
-
-            let metadata = AgentMetadata {
-                agent_ref: AgentRef {
-                    name: alias.clone(),
-                    version: info.version.to_string(),
-                    url: None,
-                },
-                description: description.clone(),
-            };
-
-            let input_schema = serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "messages": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "role": { "type": "string" },
-                                "content": { "type": "string" }
-                            },
-                            "required": ["role", "content"]
-                        }
-                    }
-                },
-                "required": ["messages"]
-            });
-
-            let output_schema = serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "messages": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "role": { "type": "string" },
-                                "content": { "type": "string" }
-                            },
-                            "required": ["role", "content"]
-                        }
-                    }
-                }
-            });
-
-            let config_schema = serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "temperature": { "type": "number", "minimum": 0.0, "maximum": 2.0 },
-                    "max_tokens": { "type": "integer", "minimum": 1 },
-                    "top_p": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
-                }
-            });
-
-            let thread_state_schema = serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "messages": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "role": { "type": "string" },
-                                "content": { "type": "string" }
-                            }
-                        }
-                    }
-                }
-            });
-
-            let specs = AgentACPSpec {
-                capabilities: AgentCapabilities {
-                    threads: true,
-                    interrupts: false,
-                    callbacks: false,
-                    streaming: Some(StreamingCapabilities {
-                        values: Some(true),
-                        custom: Some(false),
-                    }),
-                },
-                input: input_schema,
-                output: output_schema,
-                config: config_schema,
-                thread_state: Some(thread_state_schema),
-                interrupts: None,
-                custom_streaming_update: None,
-            };
-
-            let is_loaded = model.is_loaded().await.unwrap_or(false);
-
-            let entry = AgentEntry {
-                agent: Agent {
-                    agent_id: id,
-                    metadata: metadata.clone(),
-                },
-                descriptor: AgentACPDescriptor {
-                    metadata,
-                    specs,
-                },
-                model_alias: alias,
-                is_loaded,
-            };
-
-            agents.insert(id, entry);
+            let entry = Self::make_agent_entry(&model, &alias).await;
+            agents.insert(entry.agent.agent_id, entry);
         }
 
         agents
+    }
+
+    /// Build a single-agent registry for just one model alias.
+    /// Avoids the full catalog scan that can trigger ORT API version warnings.
+    pub async fn build_agent_single(
+        manager: &'static foundry_local_sdk::FoundryLocalManager,
+        alias: &str,
+    ) -> HashMap<Uuid, AgentEntry> {
+        let mut agents = HashMap::new();
+        match manager.catalog().get_model(alias).await {
+            Ok(model) => {
+                let entry = Self::make_agent_entry(&model, alias).await;
+                agents.insert(entry.agent.agent_id, entry);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to get model '{alias}': {e}");
+            }
+        }
+        agents
+    }
+
+    /// Create an AgentEntry from a Foundry model.
+    async fn make_agent_entry(
+        model: &foundry_local_sdk::Model,
+        alias: &str,
+    ) -> AgentEntry {
+        let id = agent_id_from_alias(alias);
+        let info = model.info();
+
+        let description = format!(
+            "Foundry Local model '{}' ({}) — {}",
+            alias,
+            info.model_type,
+            info.display_name
+                .as_deref()
+                .unwrap_or(&info.name)
+        );
+
+        let metadata = AgentMetadata {
+            agent_ref: AgentRef {
+                name: alias.to_string(),
+                version: info.version.to_string(),
+                url: None,
+            },
+            description: description.clone(),
+        };
+
+        let input_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "messages": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": { "type": "string" },
+                            "content": { "type": "string" }
+                        },
+                        "required": ["role", "content"]
+                    }
+                }
+            },
+            "required": ["messages"]
+        });
+
+        let output_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "messages": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": { "type": "string" },
+                            "content": { "type": "string" }
+                        },
+                        "required": ["role", "content"]
+                    }
+                }
+            }
+        });
+
+        let config_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "temperature": { "type": "number", "minimum": 0.0, "maximum": 2.0 },
+                "max_tokens": { "type": "integer", "minimum": 1 },
+                "top_p": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+            }
+        });
+
+        let thread_state_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "messages": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": { "type": "string" },
+                            "content": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        });
+
+        let specs = AgentACPSpec {
+            capabilities: AgentCapabilities {
+                threads: true,
+                interrupts: false,
+                callbacks: false,
+                streaming: Some(StreamingCapabilities {
+                    values: Some(true),
+                    custom: Some(false),
+                }),
+            },
+            input: input_schema,
+            output: output_schema,
+            config: config_schema,
+            thread_state: Some(thread_state_schema),
+            interrupts: None,
+            custom_streaming_update: None,
+        };
+
+        let is_loaded = model.is_loaded().await.unwrap_or(false);
+        tracing::debug!("Discovered model '{}' (loaded={})", alias, is_loaded);
+
+        AgentEntry {
+            agent: Agent {
+                agent_id: id,
+                metadata: metadata.clone(),
+            },
+            descriptor: AgentACPDescriptor {
+                metadata,
+                specs,
+            },
+            model_alias: alias.to_string(),
+            is_loaded,
+        }
     }
 
     /// Create a new run record and return its ID.

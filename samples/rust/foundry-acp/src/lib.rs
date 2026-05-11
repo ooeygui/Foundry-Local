@@ -153,19 +153,39 @@ pub async fn init_state_with_config(
     model_alias: Option<&str>,
     config: ServerConfig,
 ) -> Result<Arc<AppState>, Box<dyn std::error::Error>> {
-    // Download execution providers
-    manager.download_and_register_eps(None).await?;
+    // Download and register execution providers (needed for GPU model loading).
+    // Note: This may emit ORT API version warnings for incompatible EP variants
+    // (e.g., TensorRT-RTX requiring ORT API 24). These warnings are harmless.
+    tracing::info!("Registering execution providers...");
+    match manager.download_and_register_eps(None).await {
+        Ok(_result) => tracing::info!("Execution providers registered"),
+        Err(e) => tracing::warn!("Failed to register some execution providers: {e}"),
+    }
 
     // Optionally load a specific model
     if let Some(alias) = model_alias {
         let model = manager.catalog().get_model(alias).await?;
         if !model.is_cached().await? {
+            tracing::info!("Downloading model '{alias}'...");
             model.download(None::<fn(f64)>).await?;
         }
-        model.load().await?;
+        match model.load().await {
+            Ok(()) => tracing::info!("Model '{alias}' loaded successfully"),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to eagerly load model '{alias}': {e}. \
+                     It will be loaded lazily on first request."
+                );
+            }
+        }
     }
 
-    let agents = AppState::build_agents(manager).await;
+    // Build agent registry — skip full catalog scan when a single model is specified
+    let agents = if let Some(alias) = model_alias {
+        AppState::build_agent_single(manager, alias).await
+    } else {
+        AppState::build_agents(manager).await
+    };
 
     // Initialise persistence
     let db = if let Some(path) = &config.db_path {
